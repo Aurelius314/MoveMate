@@ -4,11 +4,16 @@ from flask import Flask, render_template, request, jsonify
 import os
 import cv2
 import mediapipe as mp
+import matplotlib
+matplotlib.use("Agg")  # 无界面后端，分析在后台线程中运行
 import matplotlib.pyplot as plt
+from matplotlib.patches import FancyBboxPatch
+from matplotlib.offsetbox import OffsetImage, AnnotationBbox
+from collections import defaultdict
+import threading
 from tqdm import tqdm
 import numpy as np
 import ruptures as rpt
-import matplotlib.pyplot as plt
 from scipy.signal import find_peaks
 from scipy.signal import savgol_filter
 import statsmodels.api as sm
@@ -223,11 +228,12 @@ def process_frame(image):
         "motion_state": None
     }
 
-    people_count = detect_people(image)
-    frame_data.update({"people_count": people_count})
-    draw_text(image, f"YOLO: People: {people_count}")
-
     pose_data = process_pose(image)
+    # MediaPipe Pose 只跟踪单人，检测到姿态即记为 1 人
+    people_count = 0 if pose_data == "Insufficient data" else 1
+    frame_data.update({"people_count": people_count})
+    draw_text(image, f"People: {people_count}")
+
     if pose_data == "Insufficient data":
         draw_text(image, 'No Person', (25, 200))
     else:
@@ -326,11 +332,12 @@ def load_json_data(filename):
     except (FileNotFoundError, json.JSONDecodeError):
         # 处理文件不存在或 JSON 解析失败的情况
         print(f"错误: 无法读取 {filename}，请检查文件路径或格式。")
-        return 0, [], [], [], [], []
+        return 0, [], [], [], []
 
     # 解析 JSON 数据
     fps = data.get("fps", 30)  # 读取 fps，默认为 30
     frames = data.get("frames", [])  # 读取帧数据列表，如果不存在则默认为空列表
+    frames = [frame or {} for frame in frames]  # 处理失败的帧可能为 null
 
     # 提取每一帧的数据
     people_counts = [frame.get("people_count") for frame in frames]
@@ -2020,7 +2027,70 @@ IMAGE_FOLDER = "static/images"
 if not os.path.exists(IMAGE_FOLDER):
     os.makedirs(IMAGE_FOLDER)
 
+RESULT_FOLDER = "static/results"
+if not os.path.exists(RESULT_FOLDER):
+    os.makedirs(RESULT_FOLDER)
+
 video_filename = None
+analysis_results = {}  # 视频路径 -> 分析状态/结果
+analysis_lock = threading.Lock()  # MediaPipe pose 实例不是线程安全的，串行执行分析
+
+def run_analysis(video_path):
+    """完整的视频分析流程：逐帧提取姿态 -> 姿态分段 -> 周期性检测 -> 生成结果图"""
+    try:
+        with analysis_lock:
+            name = os.path.splitext(os.path.basename(video_path))[0]
+            json_filename = os.path.join(RESULT_FOLDER, f"{name}.json")
+            generate_video2(video_path, json_filename)
+
+            fps, people_counts, body_height, orientation, head_y = load_json_data(json_filename)
+            if not orientation:
+                raise ValueError("No frames could be analyzed.")
+
+            people_counts, orientation = smooth_stable_data(people_counts, orientation)
+            orientation_segments = first_orientation_segments(orientation, body_height, head_y, fps)
+            orientation_segments, orientation, body_height, head_y = filter_invalid_orientation_segments(
+                orientation_segments, orientation, body_height, head_y, fps)
+
+            change_points = detect_change_points(body_height, visualize=False)
+            orientation_segments, orientation, body_height, head_y = remove_large_height_changes(
+                change_points, orientation_segments, orientation, body_height, head_y, fps)
+            orientation_segments = merge_alternating_orients(orientation_segments, fps)
+            orientation_segments, orientation, body_height, head_y = merge_orientation_segments(
+                orientation_segments, orientation, body_height, head_y, fps)
+
+            segmented_head_y = split_head_y_by_orientation(orientation_segments, head_y)
+            segmented_head_y, split_info = process_segmented_head_y(segmented_head_y)
+
+            periodics = []
+            means = []
+            amps = []
+            for segment in segmented_head_y:
+                segment = np.array(segment, dtype=float)
+                periodic, mean, amp = detect_periodicity_acf_with_peaks(segment)
+                if periodic and amp < 0.05:
+                    periodic = False
+                periodics.append(periodic)
+                means.append(mean)
+                amps.append(amp)
+
+            orientation_segments = split_orientation_segments(orientation_segments, segmented_head_y, split_info)
+            orientation_segments = update_orientation_segments(orientation_segments, periodics, means, amps)
+
+            image_path_1 = os.path.join(RESULT_FOLDER, f"{name}_1.png")
+            image_path_2 = os.path.join(RESULT_FOLDER, f"{name}_2.png")
+            plot_orientation_segments(orientation_segments, image_path_1)
+            plot_orientation_bar_chart(orientation_segments, image_path_2)
+
+        version = int(time.time())  # 防止浏览器缓存旧图
+        analysis_results[video_path] = {
+            "done": True,
+            "image_url_1": f"/{image_path_1}?v={version}" if os.path.exists(image_path_1) else None,
+            "image_url_2": f"/{image_path_2}?v={version}" if os.path.exists(image_path_2) else None,
+        }
+    except Exception as e:
+        print(f"视频分析失败: {e}")
+        analysis_results[video_path] = {"done": True, "error": str(e)}
 
 @app.route('/')
 def index():
@@ -2044,6 +2114,9 @@ def handle_upload():
     video_filename = os.path.join(UPLOAD_FOLDER, file.filename)
     file.save(video_filename)
 
+    analysis_results[video_filename] = {"done": False}
+    threading.Thread(target=run_analysis, args=(video_filename,), daemon=True).start()
+
     return jsonify({"status": "success"})
 
 @app.route("/get_video")
@@ -2052,85 +2125,9 @@ def get_video():
 
 @app.route("/check_status")
 def check_status():
-    # json_filename = xxx
-    # generate_video2(video_filename, json_filename)
-
-    # fps, people_counts, body_height, orientation, head_y = load_json_data(filename)
-    #
-    # people_counts, orientation = smooth_stable_data(people_counts, orientation)
-    # orientation_segments = first_orientation_segments(orientation, body_height, head_y, fps)
-    # orientation_segments, orientation, body_height, head_y = filter_invalid_orientation_segments(orientation_segments,
-    #                                                                                              orientation,
-    #                                                                                              body_height, head_y,
-    #                                                                                              fps)
-    #
-    # change_points = detect_change_points(body_height, visualize=False)
-    # orientation_segments, orientation, body_height, head_y = remove_large_height_changes(change_points,
-    #                                                                                      orientation_segments,
-    #                                                                                      orientation, body_height,
-    #                                                                                      head_y, fps)
-    # orientation_segments = merge_alternating_orients(orientation_segments, fps)
-    # orientation_segments, orientation, body_height, head_y = merge_orientation_segments(orientation_segments,
-    #                                                                                     orientation, body_height,
-    #                                                                                     head_y, fps)
-    #
-    # segmented_head_y = split_head_y_by_orientation(orientation_segments, head_y)
-    # segmented_head_y, split_info = process_segmented_head_y(segmented_head_y)
-    #
-    # periodics = []
-    # means = []
-    # amps = []
-    # for segment in segmented_head_y:
-    #     segment = np.array(segment, dtype=float)
-    #     periodic, mean, amp = detect_periodicity_acf_with_peaks(segment)
-    #     if periodic:
-    #         if amp < 0.05:
-    #             periodic = False
-    #     periodics.append(periodic)
-    #     means.append(mean)
-    #     amps.append(amp)
-    #
-    # orientation_segments = split_orientation_segments(orientation_segments, segmented_head_y, split_info)
-    # orientation_segments = update_orientation_segments(orientation_segments, periodics, means, amps)
-
-    # IMAGE_FOLDER = "MoveMate/static/images"
-    # if not os.path.exists(IMAGE_FOLDER):
-    #     os.makedirs(IMAGE_FOLDER)
-    #
-    # image_path_1 = os.path.join(IMAGE_FOLDER, 'result_plot_1.png')
-    # image_path_2 = os.path.join(IMAGE_FOLDER, 'result_plot_2.png')
-
-    # plot_orientation_segments(orientation_segments, image_path_1)
-    # plot_orientation_bar_chart(orientation_segments, image_path_2)
-    # segments, image = analyze_video_orientation(orientation_segments, fps)
-    # print(segments)
-
-    # image_urls = {}
-    # image_urls[f"image_url_1"] = "/" + image_path_1 if image_path_1 else None
-    # image_urls[f"image_url_2"] = "/" + image_path_2 if image_path_2 else None
-    # image_urls["image_url1"] = None
-    # image_urls["image_url2"] = None
-    # i = 1
-    # for index, img in enumerate(image, start=1):  # 从1开始编号
-    #     if img == 1:
-    #         image_urls[f"image_url{i}"] = "/" + os.path.join(IMAGE_FOLDER, '1.png')
-    #         i += 1
-    #     elif img == 2:
-    #         image_urls[f"image_url{i}"] = "/" + os.path.join(IMAGE_FOLDER, '2.png')
-    #         i += 1
-    #     elif img == 3:
-    #         image_urls[f"image_url{i}"] = "/" + os.path.join(IMAGE_FOLDER, '3.png')
-
-    # 构建返回的 JSON 数据
-    response_data = {
-        "done": True
-    }
-    # response_data.update(segments)
-    # response_data.update(image_urls)  # 添加图片 URL 键值对
-
-    # 返回 JSON 数据
-    return jsonify(response_data)
+    if not video_filename:
+        return jsonify({"done": True, "error": "No video uploaded."})
+    return jsonify(analysis_results.get(video_filename, {"done": False}))
 
 # if __name__ == "__main__":
 #     app.run(debug=True)
-
